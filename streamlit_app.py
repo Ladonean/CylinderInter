@@ -6,13 +6,13 @@ import plotly.graph_objects as go
 
 
 # =============================
-# Funkcje geometryczne
+# Funkcje pomocnicze – geometria
 # =============================
 
-def create_cylinder(radius, height, sections=64):
+def create_cylinder_mesh(radius, height, sections=64):
     """
-    Tworzy walec o zadanym promieniu i wysokości, wzdłuż osi Z,
-    środkiem w (0, 0, 0). Wysokość: od -h/2 do +h/2.
+    Tworzy siatkę cylindra (trimesh) wzdłuż osi Z,
+    środek w (0,0,0), z od -h/2 do +h/2.
     """
     return trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
 
@@ -26,60 +26,73 @@ def euler_transform(rx_deg, ry_deg, rz_deg, tx=0.0, ty=0.0, tz=0.0):
     ry = np.radians(ry_deg)
     rz = np.radians(rz_deg)
 
-    # rotacja w kolejności X -> Y -> Z (tzw. 'rxyz')
     R = euler_matrix(rx, ry, rz, 'rxyz')
     T = translation_matrix([tx, ty, tz])
 
-    # najpierw obrót, potem przesunięcie
     M = T @ R
     return M
 
 
-def intersect_cylinders(
+def sample_intersection_points(
     r1, h1,
     r2, h2,
     rx_deg, ry_deg, rz_deg,
     tx=0.0, ty=0.0, tz=0.0,
-    sections=128
+    n_theta=360,
+    n_z=200,
+    tol_factor=0.02,
 ):
     """
+    NUMERYCZNE przybliżenie krzywej przecięcia:
+    - próbkujemy powierzchnię cylindra 1 (oś Z, promień r1, wysokość h1),
+    - dla każdego punktu sprawdzamy, czy leży też na powierzchni cylindra 2.
+
     Zwraca:
-      - mesh przecięcia (trimesh.Trimesh)
-      - unikalne wierzchołki przecięcia jako numpy.ndarray (N, 3)
-      - oba cylindry (cyl1, cyl2) po ustawieniach
+      - points (N, 3): punkty przybliżonej krzywej przecięcia
+      - M: macierz transformacji cylindra 2 (do wizualizacji)
     """
-    # Cylinder 1 – prosty, oś Z
-    cyl1 = create_cylinder(r1, h1, sections=sections)
-
-    # Cylinder 2 – początkowo też oś Z
-    cyl2 = create_cylinder(r2, h2, sections=sections)
-
-    # Transformacja cylindra 2: rotacja + przesunięcie
+    # Macierz transformacji cylindra 2
     M = euler_transform(rx_deg, ry_deg, rz_deg, tx, ty, tz)
-    cyl2 = cyl2.copy()
-    cyl2.apply_transform(M)
+    M_inv = np.linalg.inv(M)
 
-    # Boolean intersection
-    # W razie problemów można spróbować:
-    # inter = cyl1.intersection(cyl2, engine="scad")
-    inter = cyl1.intersection(cyl2)
+    # Parametry próbkowania cylindra 1
+    thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    zs = np.linspace(-h1 / 2.0, h1 / 2.0, n_z)
 
-    if inter.is_empty:
-        points_unique = np.empty((0, 3))
-    else:
-        points = inter.vertices
-        points_unique = np.unique(points, axis=0)
+    Theta, Z = np.meshgrid(thetas, zs)
+    X = r1 * np.cos(Theta)
+    Y = r1 * np.sin(Theta)
 
-    return inter, points_unique, cyl1, cyl2
+    pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)  # (N, 3)
+    N = pts.shape[0]
+
+    # Zamiana na współrzędne lokalne cylindra 2: p' = M_inv * p
+    pts_h = np.hstack([pts, np.ones((N, 1))])  # (N, 4)
+    pts_local = (M_inv @ pts_h.T).T  # (N, 4)
+    x2 = pts_local[:, 0]
+    y2 = pts_local[:, 1]
+    z2 = pts_local[:, 2]
+
+    # Warunek "w pobliżu powierzchni cylindra 2"
+    # promień w lokalnych współrzędnych cylindra 2:
+    rho2 = np.sqrt(x2**2 + y2**2)
+
+    # tolerancja względem promienia
+    tol = tol_factor * min(r1, r2)
+
+    on_radius = np.abs(rho2 - r2) < tol
+    within_height = np.abs(z2) <= (h2 / 2.0 + tol)
+
+    mask = on_radius & within_height
+    intersection_points = pts[mask]
+
+    return intersection_points, M
 
 
 def mesh_to_plotly(mesh, name, opacity=0.3, color="blue"):
     """
-    Konwersja trimesh.Trimesh do obiektu Plotly Mesh3d.
+    Konwersja trimesh.Trimesh do Plotly Mesh3d.
     """
-    if mesh.is_empty:
-        return None
-
     x, y, z = mesh.vertices.T
     i, j, k = mesh.faces.T
 
@@ -92,7 +105,7 @@ def mesh_to_plotly(mesh, name, opacity=0.3, color="blue"):
         k=k,
         name=name,
         opacity=opacity,
-        color=color
+        color=color,
     )
 
 
@@ -106,17 +119,17 @@ def main():
         layout="wide"
     )
 
-    st.title("Przecięcie dwóch cylindrów (trimesh + Streamlit)")
+    st.title("Przecięcie dwóch cylindrów (bez boolean, działa na Streamlit Cloud)")
 
     st.markdown(
         """
-        - **Cylinder 1** – zawsze prosty, wzdłuż osi Z, zadanego promienia i wysokości.  
-        - **Cylinder 2** – ma własny promień, wysokość, 3 kąty (Euler X/Y/Z) oraz przesunięcie (tx, ty, tz).  
-        - Wynik: **chmura punktów z przecięcia** + wizualizacja 3D.
+        - **Cylinder 1** – bazowy, prosty wzdłuż osi Z.  
+        - **Cylinder 2** – ma własny promień, wysokość, 3 kąty Eulera oraz przesunięcie.  
+        - Przecięcie jest liczone **numerycznie** przez próbkowanie powierzchni cylindra 1.  
         """
     )
 
-    # --- Panel parametrów ---
+    # ---- PANEL PARAMETRÓW ----
     st.sidebar.header("Parametry cylindrów")
 
     # Cylinder 1
@@ -142,77 +155,94 @@ def main():
     tz = st.sidebar.slider("tz", -10.0, 10.0, 0.0, 0.1)
 
     st.sidebar.markdown("---")
-    sections = st.sidebar.slider(
-        "Gęstość siatki (liczba sekcji)",
-        16, 256, 128, 16,
-        help="Im więcej sekcji, tym dokładniejsze bryły, ale wolniejsze obliczenia."
-    )
+    st.sidebar.subheader("Parametry próbkowania")
+    n_theta = st.sidebar.slider("Próbki po obwodzie (n_theta)", 36, 720, 360, 12)
+    n_z = st.sidebar.slider("Próbki po wysokości (n_z)", 20, 400, 200, 10)
+    tol_factor = st.sidebar.slider(
+        "Tolerancja względem promienia (procent minimalnego promienia)",
+        0.1, 10.0, 2.0, 0.1
+    ) / 100.0  # konwersja z % na ułamek
 
-    st.markdown("Kliknij przycisk, żeby policzyć przecięcie cylindrów dla zadanych parametrów.")
+    st.markdown("Ustaw parametry i kliknij **Oblicz przecięcie**.")
 
     if st.button("Oblicz przecięcie"):
-        with st.spinner("Liczenie przecięcia cylindrów..."):
-            inter_mesh, points, cyl1, cyl2 = intersect_cylinders(
+        with st.spinner("Liczenie przybliżonej krzywej przecięcia..."):
+            points, M2 = sample_intersection_points(
                 r1, h1,
                 r2, h2,
                 rx, ry, rz,
                 tx, ty, tz,
-                sections=sections
+                n_theta=n_theta,
+                n_z=n_z,
+                tol_factor=tol_factor
             )
 
-        # --- Wyniki tekstowe / tabelaryczne ---
+            # siatki do wizualizacji
+            cyl1_mesh = create_cylinder_mesh(r1, h1, sections=64)
+            cyl2_mesh = create_cylinder_mesh(r2, h2, sections=64)
+            cyl2_mesh = cyl2_mesh.copy()
+            cyl2_mesh.apply_transform(M2)
+
+        # ---- WYNIKI ----
         st.subheader("Wyniki")
-        st.write(f"**Liczba punktów na przecięciu:** {points.shape[0]}")
+
+        st.write(f"**Liczba punktów na przybliżonej krzywej przecięcia:** {points.shape[0]}")
 
         if points.shape[0] == 0:
-            st.warning("Brak przecięcia cylindrów dla zadanych parametrów.")
+            st.warning("Brak przecięcia (w granicach zadanej tolerancji i próbkowania).")
         else:
-            st.write("Przykładowe punkty przecięcia (pierwsze 10):")
+            st.write("Przykładowe punkty (pierwsze 10):")
             st.dataframe(points[:10], use_container_width=True)
 
-            # Przygotowanie CSV do pobrania
+            # CSV do pobrania
             csv_lines = ["x,y,z"] + [f"{p[0]},{p[1]},{p[2]}" for p in points]
             csv_data = "\n".join(csv_lines)
 
             st.download_button(
-                label="Pobierz wszystkie punkty przecięcia jako CSV",
+                label="Pobierz punkty przecięcia jako CSV",
                 data=csv_data,
-                file_name="intersekcja_cylindrow.csv",
+                file_name="intersekcja_cylindrow_sampled.csv",
                 mime="text/csv"
             )
 
-        # --- Wizualizacja 3D ---
+        # ---- WIZUALIZACJA 3D ----
         st.subheader("Wizualizacja 3D")
 
         fig = go.Figure()
 
-        # Cylinder 1 – niebieski
-        m1 = mesh_to_plotly(cyl1, "Cylinder 1", opacity=0.2, color="blue")
-        # Cylinder 2 – zielony
-        m2 = mesh_to_plotly(cyl2, "Cylinder 2", opacity=0.2, color="green")
-        # Przecięcie – czerwone
-        mi = mesh_to_plotly(inter_mesh, "Przecięcie", opacity=0.9, color="red")
+        m1 = mesh_to_plotly(cyl1_mesh, "Cylinder 1", opacity=0.25, color="blue")
+        m2 = mesh_to_plotly(cyl2_mesh, "Cylinder 2", opacity=0.25, color="green")
 
-        if m1:
-            fig.add_trace(m1)
-        if m2:
-            fig.add_trace(m2)
-        if mi:
-            fig.add_trace(mi)
+        fig.add_trace(m1)
+        fig.add_trace(m2)
+
+        # punkty przecięcia jako chmura
+        if points.shape[0] > 0:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=points[:, 0],
+                    y=points[:, 1],
+                    z=points[:, 2],
+                    mode="markers",
+                    name="Przybliżona krzywa przecięcia",
+                    marker=dict(size=3)
+                )
+            )
 
         fig.update_layout(
             scene=dict(
                 xaxis_title="X",
                 yaxis_title="Y",
                 zaxis_title="Z",
-                aspectmode="data"
+                aspectmode="data",
             ),
-            legend=dict(x=0.02, y=0.98)
+            legend=dict(x=0.02, y=0.98),
+            margin=dict(l=0, r=0, t=30, b=0),
         )
 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Ustaw parametry po lewej i kliknij **Oblicz przecięcie**.")
+        st.info("Kliknij **Oblicz przecięcie**, żeby zobaczyć wynik.")
 
 
 if __name__ == "__main__":
