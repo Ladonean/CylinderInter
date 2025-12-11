@@ -1,7 +1,5 @@
 streamlit
-trimesh
 numpy
+trimesh
 plotly
-shapely
-rtree
-pyembree
+scipy
