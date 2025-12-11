@@ -1,5 +1,6 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 import trimesh
 from trimesh.transformations import euler_matrix, translation_matrix, rotation_matrix
 import plotly.graph_objects as go
@@ -44,8 +45,9 @@ def rotation_z(angle_deg: float) -> np.ndarray:
 
 def create_cylinder_y_mesh(radius, height, sections=64):
     """
-    Tworzy siatkę cylindra (trimesh) wzdłuż osi Y:
-      - tworzymy cylinder wzdłuż osi Z (domyślne),
+    Tworzy siatkę cylindra (trimesh) o zadanym promieniu i wysokości,
+    którego oś jest wzdłuż osi Y:
+      - tworzymy cylinder wzdłuż osi Z (domyślne w trimesh),
       - obracamy o +90° wokół osi X (oś Z -> oś -Y).
     """
     mesh = trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
@@ -127,42 +129,41 @@ def sample_intersection_points(
 
 def fit_oval_and_sample(points: np.ndarray, step_deg: float = 0.5):
     """
-    Z surowych punktów przecięcia:
+    Z surowych punktów jednego przecięcia:
       1. Dopasuj płaszczyznę (PCA),
       2. rzutuj na tę płaszczyznę -> współrzędne 2D (u,v),
-      3. oblicz środek (0,0) w 2D,
+      3. ustaw środek w (0,0) (średnia),
       4. przelicz punkty na (angle, radius),
       5. dopasuj splajn 1D r(angle),
       6. zwróć punkty na owalu co 'step_deg' stopni od środka.
 
     Zwraca:
-      - angles_deg (M,)  – kąty w stopniach (0..~360)
+      - angles_deg (M,)   – kąty w stopniach (0..~360)
       - points_oval (M,3) – punkty 3D owalu
-      - center (3,)      – środek owalu w 3D
+      - center (3,)       – środek owalu w 3D
     """
     if points.shape[0] < 10:
-        # za mało punktów na sensowny splajn
+        # za mało punktów na sensowne dopasowanie
         return np.array([]), np.empty((0, 3)), np.zeros(3)
 
     # 1. Środek w 3D
     center = points.mean(axis=0)
 
-    # 2. PCA – wektor normalny + 2 wektory w płaszczyźnie
+    # 2. PCA – znajdź płaszczyznę
     X = points - center
     cov = np.cov(X.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)  # posortowane rosnąco
+    eigvals, eigvecs = np.linalg.eigh(cov)
 
     # najmniejsza wartość -> normalna, dwie największe -> baza w płaszczyźnie
-    # eigvecs[:, 0] – smallest, 1 – mid, 2 – largest
     e1 = eigvecs[:, 2]   # główny kierunek
-    e2 = eigvecs[:, 1]   # drugi kierunek w płaszczyźnie
+    e2 = eigvecs[:, 1]   # drugi w płaszczyźnie
 
     # 3. Projekcja na płaszczyznę (u,v)
     u = X @ e1
     v = X @ e2
 
-    # 4. (angle, radius) w tej płaszczyźnie
-    angles = np.arctan2(v, u)              # [-pi, pi]
+    # 4. (angle, radius)
+    angles = np.arctan2(v, u)               # [-pi, pi]
     angles = (angles + 2 * np.pi) % (2 * np.pi)  # [0, 2pi)
     radius = np.sqrt(u**2 + v**2)
 
@@ -173,10 +174,10 @@ def fit_oval_and_sample(points: np.ndarray, step_deg: float = 0.5):
 
     # 5. Splajn r(angle)
     try:
-        # lekkie wygładzenie
-        spl = UnivariateSpline(angles_sorted, radius_sorted, s=len(radius_sorted) * 1e-6, k=3)
+        spl = UnivariateSpline(angles_sorted, radius_sorted,
+                               s=len(radius_sorted) * 1e-6, k=3)
     except Exception:
-        # fallback – bez splajnu: po prostu posortowane punkty
+        # fallback – bez splajnu, tylko posortowane punkty
         angles_deg = np.degrees(angles_sorted)
         points_oval = center + np.outer(radius_sorted * np.cos(angles_sorted), e1) \
                                + np.outer(radius_sorted * np.sin(angles_sorted), e2)
@@ -222,22 +223,21 @@ def mesh_to_plotly(mesh, name, opacity=0.3, color="blue"):
 
 def main():
     st.set_page_config(
-        page_title="Przecięcie cylindrów – owal co 0,5°",
+        page_title="Przecięcie cylindrów – dwa owale co kąt",
         layout="wide"
     )
 
-    st.title("Przecięcie dwóch cylindrów – owal + punkty co kąt od środka")
+    st.title("Przecięcie dwóch cylindrów – góra/dół, owal + punkty co kąt")
 
     st.markdown(
         """
-        - Cylinder 1: oś **Y**, promień \\(r_1\\), wysokość \\(h_1\\), obrót wokół osi Z.  
-        - Cylinder 2: oś Y w lokalnym układzie, promień \\(r_2\\), wysokość \\(h_2\\),
+        - **Cylinder 1**: oś **Y**, promień \\(r_1\\), wysokość \\(h_1\\), obrót wokół osi Z.  
+        - **Cylinder 2**: oś Y w lokalnym układzie, promień \\(r_2\\), wysokość \\(h_2\\),
           kąty Eulera \\(r_x, r_y, r_z\\) + przesunięcie.  
-        - Krzywa przecięcia:  
-          1. liczona numerycznie (sampling powierzchni cylindra 1),  
-          2. rzutowana na najlepszą płaszczyznę,  
-          3. aproksymowana **owalem** przez splajn promienia w funkcji kąta,  
-          4. punkty podawane **co zadany kąt (np. 0,5°) od środka owalu**.
+        - Z surowych punktów przecięcia:
+          - dzielimy na **górne** i **dolne** przecięcie (po osi Y),
+          - dla każdego dopasowujemy osobny **owal**,
+          - wyznaczamy punkty co zadany kąt (np. 0,5°) od środka owalu.  
         """
     )
 
@@ -294,10 +294,11 @@ def main():
         0.1, 5.0, 0.5, 0.1
     )
 
-    st.markdown("Ustaw parametry i kliknij **Oblicz owal przecięcia**.")
+    st.markdown("Ustaw parametry i kliknij **Oblicz owale przecięcia**.")
 
-    if st.button("Oblicz owal przecięcia"):
-        with st.spinner("Liczenie punktów przecięcia i owalu..."):
+    if st.button("Oblicz owale przecięcia"):
+        with st.spinner("Liczenie punktów przecięcia i owalów..."):
+            # surowe punkty przecięcia
             points_raw, Rz_base, M2 = sample_intersection_points(
                 r1, h1,
                 r2, h2,
@@ -316,67 +317,99 @@ def main():
             cyl2_mesh = create_cylinder_y_mesh(r2, h2, sections=64)
             cyl2_mesh.apply_transform(M2)
 
-            # owal + punkty co step_deg
+            # podział na górę / dół po osi Y
             if points_raw.shape[0] > 0:
-                angles_deg, points_oval, center = fit_oval_and_sample(points_raw, step_deg=step_deg)
+                y_vals = points_raw[:, 1]
+                y_med = np.median(y_vals)
+
+                pts_top = points_raw[y_vals >= y_med]
+                pts_bottom = points_raw[y_vals < y_med]
+
+                angles_top, oval_top, center_top = fit_oval_and_sample(pts_top, step_deg=step_deg) if pts_top.shape[0] > 0 else (np.array([]), np.empty((0, 3)), np.zeros(3))
+                angles_bottom, oval_bottom, center_bottom = fit_oval_and_sample(pts_bottom, step_deg=step_deg) if pts_bottom.shape[0] > 0 else (np.array([]), np.empty((0, 3)), np.zeros(3))
             else:
-                angles_deg = np.array([])
-                points_oval = np.empty((0, 3))
-                center = np.zeros(3)
+                pts_top = np.empty((0, 3))
+                pts_bottom = np.empty((0, 3))
+                angles_top = angles_bottom = np.array([])
+                oval_top = oval_bottom = np.empty((0, 3))
+                center_top = center_bottom = np.zeros(3)
 
         # ---- WYNIKI ----
         st.subheader("Wyniki")
 
         st.write(f"**Liczba surowych punktów przecięcia (sampling):** {points_raw.shape[0]}")
-        st.write(f"**Liczba punktów na owalu co {step_deg}°:** {points_oval.shape[0]}")
+        st.write(f"**Górne przecięcie – liczba punktów surowych:** {pts_top.shape[0]}")
+        st.write(f"**Dolne przecięcie – liczba punktów surowych:** {pts_bottom.shape[0]}")
 
         if points_raw.shape[0] == 0:
             st.warning("Brak punktów przecięcia (w granicach zadanej tolerancji i próbkowania).")
-        elif points_oval.shape[0] == 0:
-            st.warning("Nie udało się dopasować owalu – za mało punktów lub problem ze splajnem.")
         else:
-            st.write("Przykładowe punkty owalu (pierwsze 10):")
-            import pandas as pd
-            df = pd.DataFrame(
-                {
-                    "angle_deg_from_center": angles_deg,
-                    "x": points_oval[:, 0],
-                    "y": points_oval[:, 1],
-                    "z": points_oval[:, 2],
-                }
-            )
-            st.dataframe(df.head(10), use_container_width=True)
+            col1, col2 = st.columns(2)
 
-            # CSV
-            csv_lines = ["angle_deg_from_center,x,y,z"] + [
-                f"{ang},{p[0]},{p[1]},{p[2]}"
-                for ang, p in zip(angles_deg, points_oval)
-            ]
-            csv_data = "\n".join(csv_lines)
+            with col1:
+                st.markdown("### Górne przecięcie")
+                if oval_top.shape[0] == 0:
+                    st.info("Brak punktów owalu dla górnego przecięcia.")
+                else:
+                    st.write(f"Liczba punktów owalu co {step_deg}° (góra): {oval_top.shape[0]}")
+                    df_top = pd.DataFrame(
+                        {
+                            "angle_deg_from_center": angles_top,
+                            "x": oval_top[:, 0],
+                            "y": oval_top[:, 1],
+                            "z": oval_top[:, 2],
+                        }
+                    )
+                    st.dataframe(df_top.head(10), use_container_width=True)
 
-            st.download_button(
-                label=f"Pobierz punkty owalu co {step_deg}° jako CSV",
-                data=csv_data,
-                file_name="owal_przeciecia_cylindrow.csv",
-                mime="text/csv"
-            )
+                    csv_top = "\n".join(
+                        ["angle_deg_from_center,x,y,z"]
+                        + [f"{ang},{p[0]},{p[1]},{p[2]}" for ang, p in zip(angles_top, oval_top)]
+                    )
+                    st.download_button(
+                        label=f"Pobierz owal GÓRA co {step_deg}° (CSV)",
+                        data=csv_top,
+                        file_name="owal_przeciecia_gora.csv",
+                        mime="text/csv",
+                    )
+
+            with col2:
+                st.markdown("### Dolne przecięcie")
+                if oval_bottom.shape[0] == 0:
+                    st.info("Brak punktów owalu dla dolnego przecięcia.")
+                else:
+                    st.write(f"Liczba punktów owalu co {step_deg}° (dół): {oval_bottom.shape[0]}")
+                    df_bottom = pd.DataFrame(
+                        {
+                            "angle_deg_from_center": angles_bottom,
+                            "x": oval_bottom[:, 0],
+                            "y": oval_bottom[:, 1],
+                            "z": oval_bottom[:, 2],
+                        }
+                    )
+                    st.dataframe(df_bottom.head(10), use_container_width=True)
+
+                    csv_bottom = "\n".join(
+                        ["angle_deg_from_center,x,y,z"]
+                        + [f"{ang},{p[0]},{p[1]},{p[2]}" for ang, p in zip(angles_bottom, oval_bottom)]
+                    )
+                    st.download_button(
+                        label=f"Pobierz owal DÓŁ co {step_deg}° (CSV)",
+                        data=csv_bottom,
+                        file_name="owal_przeciecia_dol.csv",
+                        mime="text/csv",
+                    )
 
         # ---- WIZUALIZACJA 3D ----
-        st.subheader("Wizualizacja 3D – cylindry, surowe punkty, owal")
+        st.subheader("Wizualizacja 3D – cylindry, surowe punkty, dwa owale")
 
         fig = go.Figure()
 
-        # Cylinder 1
-        fig.add_trace(
-            mesh_to_plotly(cyl1_mesh, "Cylinder 1", opacity=0.25, color="blue")
-        )
+        # cylindry
+        fig.add_trace(mesh_to_plotly(cyl1_mesh, "Cylinder 1", opacity=0.25, color="blue"))
+        fig.add_trace(mesh_to_plotly(cyl2_mesh, "Cylinder 2", opacity=0.25, color="green"))
 
-        # Cylinder 2
-        fig.add_trace(
-            mesh_to_plotly(cyl2_mesh, "Cylinder 2", opacity=0.25, color="green")
-        )
-
-        # Surowe punkty przecięcia
+        # surowe punkty przecięcia
         if points_raw.shape[0] > 0:
             fig.add_trace(
                 go.Scatter3d(
@@ -389,28 +422,29 @@ def main():
                 )
             )
 
-        # Owal (linia) + punkty co step_deg
-        if points_oval.shape[0] > 0:
+        # owal góra
+        if oval_top.shape[0] > 0:
             fig.add_trace(
                 go.Scatter3d(
-                    x=points_oval[:, 0],
-                    y=points_oval[:, 1],
-                    z=points_oval[:, 2],
+                    x=oval_top[:, 0],
+                    y=oval_top[:, 1],
+                    z=oval_top[:, 2],
                     mode="lines+markers",
-                    name=f"Owal co {step_deg}°",
+                    name=f"Owal GÓRA co {step_deg}°",
                     marker=dict(size=3),
                 )
             )
 
-            # środek owalu
+        # owal dół
+        if oval_bottom.shape[0] > 0:
             fig.add_trace(
                 go.Scatter3d(
-                    x=[center[0]],
-                    y=[center[1]],
-                    z=[center[2]],
-                    mode="markers",
-                    name="Środek owalu",
-                    marker=dict(size=5, symbol="x"),
+                    x=oval_bottom[:, 0],
+                    y=oval_bottom[:, 1],
+                    z=oval_bottom[:, 2],
+                    mode="lines+markers",
+                    name=f"Owal DÓŁ co {step_deg}°",
+                    marker=dict(size=3),
                 )
             )
 
@@ -427,7 +461,7 @@ def main():
 
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Kliknij **Oblicz owal przecięcia**, żeby zobaczyć wynik.")
+        st.info("Kliknij **Oblicz owale przecięcia**, żeby zobaczyć wynik.")
 
 
 if __name__ == "__main__":
