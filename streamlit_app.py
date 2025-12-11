@@ -3,6 +3,7 @@ import numpy as np
 import trimesh
 from trimesh.transformations import euler_matrix, translation_matrix, rotation_matrix
 import plotly.graph_objects as go
+from scipy.interpolate import splprep, splev
 
 
 # =============================
@@ -49,10 +50,8 @@ def create_cylinder_y_mesh(radius, height, sections=64):
     Implementacja:
       - tworzymy cylinder wzdłuż osi Z (domyślne w trimesh),
       - obracamy go o +90° wokół osi X, aby oś Z -> oś -Y.
-        (kierunek nie ma znaczenia – ważna jest oś).
     """
     mesh = trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
-    # obrót o 90° wokół X: oś Z przechodzi w oś -Y
     Rx = rotation_matrix(np.pi / 2.0, [1.0, 0.0, 0.0])
     mesh.apply_transform(Rx)
     return mesh
@@ -69,29 +68,23 @@ def sample_intersection_points(
     tol_factor=0.005,
 ):
     """
-    NUMERYCZNE przybliżenie krzywej przecięcia:
+    NUMERYCZNE przybliżenie krzywej przecięcia.
 
     Cylinder 1:
-      - oś Y,
-      - promień r1,
-      - wysokość h1,
+      - oś Y, promień r1, wysokość h1,
       - dodatkowy obrót wokół Z o base_rot_z_deg.
-
-      Parametryzacja (przed obrotem wokół Z):
+      Param (przed obrotem Z):
         x = r1 * cos(theta)
         z = r1 * sin(theta)
         y ∈ [-h1/2, h1/2]
 
-    Cylinder 2:
-      - w swoim lokalnym układzie: oś Y,
-        równanie: x2^2 + z2^2 = r2^2, |y2| <= h2/2
-      - transformacja globalna: Euler (rx2, ry2, rz2) + przesunięcie (tx2, ty2, tz2).
-
-    Próbkujemy powierzchnię cylindra 1 i wybieramy punkty,
-    które spełniają równanie cylindra 2 (z dokładnością tol).
+    Cylinder 2 (w lokalnym układzie):
+        x2^2 + z2^2 = r2^2, |y2| <= h2/2
 
     Zwraca:
-      - points (N, 3): punkty przybliżonej krzywej przecięcia
+      - points (N, 3)  – punkty przecięcia w globalnych współrzędnych
+      - theta_deg_sel (N,) – odpowiadający kąt (w stopniach) cylindra 1
+      - Rz_base, M2 – macierze transformacji do wizualizacji cylindrów
     """
     # Macierz transformacji cylindra 2
     M2 = euler_transform(rx2_deg, ry2_deg, rz2_deg, tx2, ty2, tz2)
@@ -104,20 +97,20 @@ def sample_intersection_points(
     thetas = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
     ys = np.linspace(-h1 / 2.0, h1 / 2.0, n_y)
 
-    Theta, Y = np.meshgrid(thetas, ys)
+    Theta, Y = np.meshgrid(thetas, ys)  # (n_y, n_theta)
     X = r1 * np.cos(Theta)
     Z = r1 * np.sin(Theta)
 
-    # Punkty w globalnym układzie przed obrotem wokół Z
     pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)  # (N, 3)
+    theta_flat = Theta.ravel()  # (N,)
     N = pts.shape[0]
 
     # Zastosuj obrót cylindra 1 wokół Z
-    pts_h = np.hstack([pts, np.ones((N, 1))])      # (N, 4)
-    pts_rot = (Rz_base @ pts_h.T).T               # (N, 4)
-    pts_global = pts_rot[:, :3]                   # (N, 3)
+    pts_h = np.hstack([pts, np.ones((N, 1))])     # (N, 4)
+    pts_rot = (Rz_base @ pts_h.T).T              # (N, 4)
+    pts_global = pts_rot[:, :3]                  # (N, 3)
 
-    # Przejście do lokalnego układu cylindra 2: p' = M2_inv * p
+    # Przejście do lokalnego układu cylindra 2
     pts_glob_h = np.hstack([pts_global, np.ones((N, 1))])  # (N, 4)
     pts_local2 = (M2_inv @ pts_glob_h.T).T                 # (N, 4)
 
@@ -125,19 +118,66 @@ def sample_intersection_points(
     y2 = pts_local2[:, 1]
     z2 = pts_local2[:, 2]
 
-    # Cylinder 2: x2^2 + z2^2 = r2^2, |y2| <= h2/2
     rho2 = np.sqrt(x2**2 + z2**2)
 
-    # Tolerancja względem promienia – im mniejsza, tym „cieńsza” krzywa
     tol = tol_factor * min(r1, r2)
-
     on_radius = np.abs(rho2 - r2) < tol
     within_height = np.abs(y2) <= (h2 / 2.0 + tol)
 
     mask = on_radius & within_height
-    intersection_points = pts_global[mask]
 
-    return intersection_points, Rz_base, M2
+    intersection_points = pts_global[mask]
+    theta_sel = theta_flat[mask]            # w radianach
+
+    theta_deg_sel = np.degrees(theta_sel)   # dla wygody
+
+    return intersection_points, theta_deg_sel, Rz_base, M2
+
+
+def spline_on_curve(points: np.ndarray, theta_deg: np.ndarray, step_deg: float = 0.5):
+    """
+    Dopasowanie splajnu 3D do punktów krzywej przecięcia,
+    parametryzowanej kątem theta (w stopniach) cylindra 1.
+
+    Zwraca:
+      - theta_samp_deg (M,) – kąty próbkowania co step_deg
+      - curve_samp (M, 3)   – współrzędne wygładzonej krzywej
+    """
+    if points.shape[0] < 5:
+        # Za mało punktów – zwracamy tylko posortowane oryginały
+        idx = np.argsort(theta_deg)
+        return theta_deg[idx], points[idx]
+
+    # Sortowanie po kącie
+    theta_rad = np.radians(theta_deg)
+    idx = np.argsort(theta_rad)
+    t = theta_rad[idx]
+    pts = points[idx]
+
+    # Odwinięcie (na wypadek skoku w okolicach 0/360)
+    t_unwrap = np.unwrap(t)
+
+    # Dopasowanie splajnu parametrycznego
+    try:
+        # małe wygładzenie s (żeby tylko "lekko" uśrednić)
+        tck, u = splprep([pts[:, 0], pts[:, 1], pts[:, 2]],
+                         u=t_unwrap, s=len(pts) * 1e-6, k=3)
+    except Exception:
+        # fallback – bez splajnu
+        return theta_deg[idx], points[idx]
+
+    # Zakres parametru
+    t_min, t_max = t_unwrap[0], t_unwrap[-1]
+
+    # krok w radianach odpowiadający step_deg
+    step_rad = np.radians(step_deg)
+    t_samp = np.arange(t_min, t_max + step_rad, step_rad)
+
+    xs, ys, zs = splev(t_samp, tck)
+    curve_samp = np.stack([xs, ys, zs], axis=1)
+    theta_samp_deg = np.degrees(t_samp)
+
+    return theta_samp_deg, curve_samp
 
 
 def mesh_to_plotly(mesh, name, opacity=0.3, color="blue"):
@@ -166,20 +206,21 @@ def mesh_to_plotly(mesh, name, opacity=0.3, color="blue"):
 
 def main():
     st.set_page_config(
-        page_title="Przecięcie dwóch cylindrów – krzywa",
+        page_title="Przecięcie dwóch cylindrów – splajn",
         layout="wide"
     )
 
-    st.title("Przecięcie dwóch cylindrów – krzywa przecięcia + cylindry")
+    st.title("Przecięcie dwóch cylindrów – krzywa przecięcia + splajn + punkty co 0,5°")
 
     st.markdown(
         """
-        - **Cylinder 1 (bazowy)** – oś **Y**, promień \\(r_1\\), wysokość \\(h_1\\),
-          dodatkowy **obrót wokół osi Z**.  
-        - **Cylinder 2** – oś Y w swoim układzie lokalnym, promień \\(r_2\\), wysokość \\(h_2\\),
-          trzy kąty Eulera \\((r_x, r_y, r_z)\\) + przesunięcie \\((t_x, t_y, t_z)\\).  
-        - Przecięcie jest liczone **numerycznie** jako krzywa (zbiór punktów) leżących
-          na obu powierzchniach.
+        - Cylinder 1: oś **Y**, promień \\(r_1\\), wysokość \\(h_1\\), obrót wokół osi Z.  
+        - Cylinder 2: oś Y w swoim lokalnym układzie, promień \\(r_2\\), wysokość \\(h_2\\),
+          kąty Eulera \\(r_x, r_y, r_z\\) + przesunięcie \\((t_x, t_y, t_z)\\).  
+        - Krzywa przecięcia:
+          1. liczona numerycznie przez sampling powierzchni cylindra 1,  
+          2. wygładzona splajnem 3D,  
+          3. próbkowana co **0,5°** po parametrze kątowym cylindra 1.
         """
     )
 
@@ -211,7 +252,7 @@ def main():
     tz2 = st.sidebar.slider("tz", -10.0, 10.0, 0.0, 0.1)
 
     st.sidebar.markdown("---")
-    st.sidebar.header("Gęstość próbkowania (im więcej, tym dokładniejsza linia)")
+    st.sidebar.header("Gęstość próbkowania powierzchni cylindra 1")
 
     n_theta = st.sidebar.slider(
         "Próbki po obwodzie cylindra 1 (n_theta)",
@@ -230,11 +271,18 @@ def main():
         f"**Łącznie próbkowanych punktów powierzchni:** ~{n_theta * n_y:,}"
     )
 
+    st.sidebar.markdown("---")
+    st.sidebar.header("Splajn krzywej")
+    step_deg = st.sidebar.slider(
+        "Krok po kącie dla punktów wynikowych [°]",
+        0.1, 5.0, 0.5, 0.1
+    )
+
     st.markdown("Ustaw parametry i kliknij **Oblicz krzywą przecięcia**.")
 
     if st.button("Oblicz krzywą przecięcia"):
-        with st.spinner("Liczenie krzywej przecięcia..."):
-            points, Rz_base, M2 = sample_intersection_points(
+        with st.spinner("Liczenie krzywej przecięcia i splajnu..."):
+            points_raw, theta_raw_deg, Rz_base, M2 = sample_intersection_points(
                 r1, h1,
                 r2, h2,
                 rx2, ry2, rz2,
@@ -252,51 +300,87 @@ def main():
             cyl2_mesh = create_cylinder_y_mesh(r2, h2, sections=64)
             cyl2_mesh.apply_transform(M2)
 
+            # Splajn + próbkowanie co step_deg
+            if points_raw.shape[0] > 0:
+                theta_samp_deg, curve_samp = spline_on_curve(
+                    points_raw, theta_raw_deg, step_deg=step_deg
+                )
+            else:
+                theta_samp_deg, curve_samp = np.array([]), np.empty((0, 3))
+
         # ---- WYNIKI ----
         st.subheader("Wyniki")
 
-        st.write(f"**Liczba znalezionych punktów krzywej przecięcia:** {points.shape[0]}")
+        st.write(f"**Liczba pierwotnych punktów przecięcia (sampling):** {points_raw.shape[0]}")
+        st.write(f"**Liczba punktów na splajnie co {step_deg}°:** {curve_samp.shape[0]}")
 
-        if points.shape[0] == 0:
+        if points_raw.shape[0] == 0:
             st.warning("Brak punktów przecięcia (w granicach zadanej tolerancji i próbkowania).")
         else:
-            st.write("Przykładowe punkty (pierwsze 10):")
-            st.dataframe(points[:10], use_container_width=True)
+            st.write("Przykładowe punkty splajnu (pierwsze 10):")
+            import pandas as pd
+            df = pd.DataFrame(
+                {
+                    "theta_deg": theta_samp_deg,
+                    "x": curve_samp[:, 0],
+                    "y": curve_samp[:, 1],
+                    "z": curve_samp[:, 2],
+                }
+            )
+            st.dataframe(df.head(10), use_container_width=True)
 
             # CSV do pobrania
-            csv_lines = ["x,y,z"] + [f"{p[0]},{p[1]},{p[2]}" for p in points]
+            csv_lines = ["theta_deg,x,y,z"] + [
+                f"{th},{p[0]},{p[1]},{p[2]}"
+                for th, p in zip(theta_samp_deg, curve_samp)
+            ]
             csv_data = "\n".join(csv_lines)
 
             st.download_button(
-                label="Pobierz punkty krzywej przecięcia jako CSV",
+                label=f"Pobierz punkty splajnu co {step_deg}° jako CSV",
                 data=csv_data,
-                file_name="krzywa_przeciecia_cylindrow.csv",
+                file_name="krzywa_przeciecia_splajn.csv",
                 mime="text/csv"
             )
 
         # ---- WIZUALIZACJA 3D ----
-        st.subheader("Wizualizacja 3D – cylindry + krzywa przecięcia")
+        st.subheader("Wizualizacja 3D – cylindry + surowe punkty + splajn")
 
         fig = go.Figure()
 
         # Cylinder 1 – półprzezroczysty
-        m1 = mesh_to_plotly(cyl1_mesh, "Cylinder 1", opacity=0.25, color="blue")
-        fig.add_trace(m1)
+        fig.add_trace(
+            mesh_to_plotly(cyl1_mesh, "Cylinder 1", opacity=0.25, color="blue")
+        )
 
         # Cylinder 2 – półprzezroczysty
-        m2 = mesh_to_plotly(cyl2_mesh, "Cylinder 2", opacity=0.25, color="green")
-        fig.add_trace(m2)
+        fig.add_trace(
+            mesh_to_plotly(cyl2_mesh, "Cylinder 2", opacity=0.25, color="green")
+        )
 
-        # Krzywa przecięcia – punkty
-        if points.shape[0] > 0:
+        # Surowe punkty przecięcia (sampling)
+        if points_raw.shape[0] > 0:
             fig.add_trace(
                 go.Scatter3d(
-                    x=points[:, 0],
-                    y=points[:, 1],
-                    z=points[:, 2],
+                    x=points_raw[:, 0],
+                    y=points_raw[:, 1],
+                    z=points_raw[:, 2],
                     mode="markers",
-                    name="Krzywa przecięcia (punkty)",
-                    marker=dict(size=3)
+                    name="Punkty przecięcia (surowe)",
+                    marker=dict(size=2),
+                )
+            )
+
+        # Splajn jako linia
+        if curve_samp.shape[0] > 0:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=curve_samp[:, 0],
+                    y=curve_samp[:, 1],
+                    z=curve_samp[:, 2],
+                    mode="lines+markers",
+                    name=f"Splajn co {step_deg}°",
+                    marker=dict(size=3),
                 )
             )
 
