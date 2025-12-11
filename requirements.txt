@@ -1,0 +1,7 @@
+streamlit==1.40.0
+trimesh==4.4.9
+numpy==2.1.3
+plotly==5.24.1
+shapely==2.0.6
+rtree==1.3.0
+pyembree==0.1.10
